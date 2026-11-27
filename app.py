@@ -43,6 +43,10 @@ def stage_cache_path(key):
     return os.path.join(get_cache_dir(), f"stage-{key}.json")
 
 
+def stage_partial_path(key):
+    return os.path.join(get_cache_dir(), f"partial-{key}.json")
+
+
 def load_cached_stages():
     loaded = {}
     for root in CFG["ROOTS"]:
@@ -56,18 +60,47 @@ def load_cached_stages():
     return loaded
 
 
+def load_partial_scan(key):
+    p = stage_partial_path(key)
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            pass
+    return None
+
+
+def save_partial_scan(key, folders, files, scanned_ids):
+    with open(stage_partial_path(key), "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "folders": folders,
+                "files": files,
+                "scanned_ids": list(scanned_ids),
+                "updated_at": datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%Y/%m/%d %H:%M"),
+            },
+            fh,
+            ensure_ascii=False,
+        )
+
+
 def save_stage_cache(key, data):
     with open(stage_cache_path(key), "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False)
+    # حذف الملف الجزئي بعد اكتمال المرحلة بالكامل
+    pp = stage_partial_path(key)
+    if os.path.exists(pp):
+        os.remove(pp)
 
 
 def clear_stage_cache(selected_keys=None):
     for root in CFG["ROOTS"]:
         if selected_keys and root["key"] not in selected_keys:
             continue
-        p = stage_cache_path(root["key"])
-        if os.path.exists(p):
-            os.remove(p)
+        for fn in (stage_cache_path(root["key"]), stage_partial_path(root["key"])):
+            if os.path.exists(fn):
+                os.remove(fn)
 
 
 def get_service_account_info():
@@ -88,6 +121,11 @@ st.markdown(
 sa_info = get_service_account_info()
 with st.expander("إعدادات الفحص والمصادقة (اختياري إذا لم تُضبط في Secrets)"):
     inspect_contents = st.checkbox("فحص الكتابة داخل الملفات والصور (PDF / Word / Excel / OCR للصور)", value=True)
+    step_mode = st.radio(
+        "نمط التشغيل:",
+        ["فحص مرحلي ذكي (يحفظ كل مؤشر/دفعة تلقائياً ويكمل الباقي)", "فحص مرحلة واحدة فقط في كل ضغطة زر"],
+        index=0,
+    )
     uploaded_sa = st.file_uploader("رفع ملف JSON لحساب الخدمة (Service Account) في حال عدم إضافته في Secrets", type=["json"])
     if uploaded_sa is not None:
         sa_info = json.load(uploaded_sa)
@@ -96,7 +134,7 @@ stages_map = load_cached_stages()
 
 b1, b2, b3 = st.columns([2, 1, 1])
 with b1:
-    run_clicked = st.button("تشغيل الفحص وبناء التقرير", type="primary", use_container_width=True)
+    run_clicked = st.button("تشغيل / إكمال الفحص وبناء التقرير", type="primary", use_container_width=True)
 with b2:
     refresh_clicked = st.button("تحديث الحالة", use_container_width=True)
 with b3:
@@ -105,7 +143,7 @@ with b3:
 if reset_clicked:
     clear_stage_cache()
     stages_map = {}
-    st.info("تم مسح نتائج الفحص المحفوظة مؤقتاً.")
+    st.info("تم مسح جميع نتائج الفحص المحفوظة مؤقتاً.")
 
 if run_clicked:
     if not sa_info:
@@ -121,15 +159,64 @@ if run_clicked:
             prog.progress(idx / total_roots)
             if root["key"] in stages_map:
                 continue
-            status_box.info(f"جارٍ فحص المرحلة وقراءة محتوى الملفات والصور: {root['name']} ({idx + 1}/{total_roots})...")
-            scanned = scan_root(drive_svc, root, budget_seconds=220, inspect_contents=inspect_contents)
-            if scanned is None:
+
+            # تحميل أي تقدم جزئي محفوظ مسبقاً لهذه المرحلة
+            prev_partial = load_partial_scan(root["key"])
+            prev_count = len(prev_partial["scanned_ids"]) if prev_partial else 0
+            extra_msg = f" (استكمال من {prev_count} عنصر مفحوص مسبقاً)" if prev_count else ""
+
+            status_box.info(
+                f"جارٍ فحص المرحلة وقراءة المؤشرات والملفات: {root['name']} ({idx + 1}/{total_roots}){extra_msg}..."
+            )
+
+            # نمرر دالة حفظ فورية (checkpoint) وتقليص الميزانية الزمنية للدفعة إلى 90 ثانية لضمان الحفظ قبل المهلة
+            def checkpoint_cb(folders, files, scanned_ids, _k=root["key"], _r=root):
+                save_partial_scan(_k, folders, files, scanned_ids)
+
+            try:
+                scanned = scan_root(
+                    drive_svc,
+                    root,
+                    budget_seconds=90,
+                    inspect_contents=inspect_contents,
+                    resume_state=prev_partial,
+                    on_checkpoint=checkpoint_cb,
+                )
+            except TypeError:
+                # توافق احتياطي في حال لم يُحدَّث scanner.py بعد
+                scanned = scan_root(drive_svc, root, budget_seconds=90, inspect_contents=inspect_contents)
+
+            if scanned is None or scanned.get("partial"):
+                if scanned and scanned.get("partial"):
+                    save_partial_scan(
+                        root["key"],
+                        scanned["folders"],
+                        scanned["files"],
+                        scanned.get("scanned_ids", []),
+                    )
+                    # حساب وعرض المؤشرات المفحوصة حتى اللحظة داخل المرحلة!
+                    temp_stage = compute_stage(root, scanned["folders"], scanned["files"])
+                    done_inds = sum(1 for r in temp_stage["rows"] if r["total"] > 0)
+                    tot_inds = len(temp_stage["rows"])
+                    st.warning(
+                        f"توقّف مؤقت لحفظ التقدم في: {root['name']} — تم حفظ ({done_inds} من {tot_inds} مؤشراً). "
+                        "اضغطي «تشغيل / إكمال الفحص وبناء التقرير» لإكمال بقية المؤشرات."
+                    )
+                else:
+                    st.warning(
+                        f"توقّف مؤقت أثناء فحص: {root['name']}. اضغطي «تشغيل / إكمال الفحص وبناء التقرير» لإكمال الباقي."
+                    )
                 partial_stop = True
-                st.warning(f"توقّف مؤقتاً أثناء فحص: {root['name']}. اضغطي «تشغيل الفحص وبناء التقرير» مرة أخرى لإكمال الباقي.")
                 break
+
             stage_res = compute_stage(root, scanned["folders"], scanned["files"])
             save_stage_cache(root["key"], stage_res)
             stages_map[root["key"]] = stage_res
+
+            if step_mode.startswith("فحص مرحلة واحدة"):
+                st.success(f"تم إكمال وحفظ المرحلة: {root['name']}. اضغطي الزر مرة أخرى لفحص المرحلة التالية.")
+                partial_stop = True
+                break
 
         prog.progress(1.0)
         status_box.empty()
@@ -141,26 +228,47 @@ if refresh_clicked:
 
 ordered_stages = [stages_map[r["key"]] for r in CFG["ROOTS"] if r["key"] in stages_map]
 
-if ordered_stages:
-    all_rows = [r for s in ordered_stages for r in s["rows"]]
+# بناء عرض شامل يشمل المراحل المكتملة + المراحل قيد الفحص الجزئي
+display_stages = []
+for r in CFG["ROOTS"]:
+    if r["key"] in stages_map:
+        display_stages.append(stages_map[r["key"]])
+    else:
+        p_scan = load_partial_scan(r["key"])
+        if p_scan:
+            st_temp = compute_stage(r, p_scan["folders"], p_scan["files"])
+            st_temp["is_partial"] = True
+            display_stages.append(st_temp)
+
+if display_stages:
+    all_rows = [r for s in display_stages for r in s["rows"]]
     tot_ind = len(all_rows)
     tot_ready = sum(1 for r in all_rows if r["judg"] == "جاهز للزيارة")
     tot_ready_pct = (tot_ready * 100.0 / tot_ind) if tot_ind else 0.0
     st.markdown(
-        f'<div class="note"><b>نسبة الجاهزية الإجمالية:</b> <span style="font-size:18px;font-weight:700;color:#0E3B28;">{tot_ready_pct:.1f}%</span> '
-        f"({tot_ready} من {tot_ind} مؤشراً · {len(ordered_stages)} من {len(CFG['ROOTS'])} مراحل)</div>",
+        f'<div class="note"><b>نسبة الجاهزية الإجمالية (للمفحوص حتى الآن):</b> '
+        f'<span style="font-size:18px;font-weight:700;color:#0E3B28;">{tot_ready_pct:.1f}%</span> '
+        f"({tot_ready} من {tot_ind} مؤشراً · {len(ordered_stages)} مراحل مكتملة من {len(CFG['ROOTS'])})</div>",
         unsafe_allow_html=True,
     )
 
 cols = st.columns(4)
 for idx, root in enumerate(CFG["ROOTS"]):
     with cols[idx % 4]:
-        if root["key"] not in stages_map:
+        p_scan = load_partial_scan(root["key"])
+        if root["key"] not in stages_map and not p_scan:
             st.markdown(f"**{root['name']}**")
             st.caption("لم يُفحص بعد")
+        elif root["key"] not in stages_map and p_scan:
+            temp_s = compute_stage(root, p_scan["folders"], p_scan["files"])
+            m = with_ready_(temp_s["summary"])
+            done_inds = sum(1 for r in temp_s["rows"] if r["total"] > 0)
+            st.markdown(f"**{m['name']}** ⏳ *(قيد الاستكمال)*")
+            st.metric("نسبة الإنجاز المؤقتة", f"{m['pct']:.1f}%", f"مؤشرات مفحوصة: {done_inds}/{m['indicators']}")
+            st.caption(f"محفوظ حتى: {p_scan.get('updated_at', '—')} · ملفات {m['files']}")
         else:
             m = with_ready_(stages_map[root["key"]]["summary"])
-            st.markdown(f"**{m['name']}**")
+            st.markdown(f"**{m['name']}** ✅")
             st.metric("نسبة الإنجاز", f"{m['pct']:.1f}%", f"الجاهزية {m['readyPct']:.1f}%")
             st.caption(
                 f"{m['indicators']} مؤشراً · جاهز {m['ready']} · فجوات {m['gap']} · تحتاج أداة {m['needtool']}\n"
@@ -170,7 +278,7 @@ for idx, root in enumerate(CFG["ROOTS"]):
 if len(ordered_stages) == len(CFG["ROOTS"]):
     st.divider()
     st.subheader("تصدير التقرير النهائي")
-    stamp = datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%d-%m-%Y_%H-%M")
+    stamp = datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d_%H-%M")
     d1, d2 = st.columns(2)
     with d1:
         pdf_bytes = build_pdf_bytes(ordered_stages)
@@ -191,11 +299,11 @@ if len(ordered_stages) == len(CFG["ROOTS"]):
             use_container_width=True,
         )
 
-if ordered_stages:
+if display_stages:
     st.divider()
-    st.subheader("تفاصيل المؤشرات حسب المرحلة")
-    selected_name = st.selectbox("اختر المرحلة لعرض المؤشرات", [s["summary"]["name"] for s in ordered_stages])
-    current_stage = next(s for s in ordered_stages if s["summary"]["name"] == selected_name)
+    st.subheader("تفاصيل المؤشرات حسب المرحلة (تشمل المحفوظ جزئياً)")
+    selected_name = st.selectbox("اختر المرحلة لعرض المؤشرات", [s["summary"]["name"] for s in display_stages])
+    current_stage = next(s for s in display_stages if s["summary"]["name"] == selected_name)
 
     f1, f2, f3 = st.columns(3)
     with f1:
@@ -217,10 +325,11 @@ if ordered_stages:
         if q_filter.strip() and (q_filter.strip() not in r["code"] and q_filter.strip() not in r["title"]):
             continue
         filtered.append({
+            "المجال": f"{r['dom']} · {DOMAINS.get(r['dom'], '')}",
             "الرمز": r["code"],
             "المؤشر": r["title"],
             "ملفات": f"{r['total']} / {r['uniq']}",
-            "الإنجاز %": round(r["pct"]),
+            "الإنجاز %": round(r["pct"], 1),
             "الحكم": r["judg"],
             "الاقتراحات": " • ".join(r["suggestions"]) if r["suggestions"] else "—",
         })
