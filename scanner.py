@@ -199,57 +199,125 @@ def extract_content(file_meta, service, tmp_dir):
     return "", "metadata_only", "metadata_only"
 
 
-def scan_root(service, root, budget_seconds=240, inspect_contents=True):
+def scan_root(
+    service,
+    root,
+    budget_seconds=90,
+    inspect_contents=True,
+    resume_state=None,
+    on_checkpoint=None,
+):
     start = time.monotonic()
-    folders = {
-        root["id"]: {"id": root["id"], "title": root["name"], "parentId": None, "viewUrl": ""}
-    }
-    raw_files = []
-    queue = [root["id"]]
 
-    while queue:
-        if time.monotonic() - start > budget_seconds:
-            return None
-        pid = queue.pop(0)
-        for c in list_children(service, pid):
-            parent = (c.get("parents") or [pid])[0]
-            if c.get("mimeType") == "application/vnd.google-apps.folder":
-                folders[c["id"]] = {
-                    "id": c["id"],
-                    "title": c.get("name", ""),
-                    "parentId": parent,
-                    "viewUrl": c.get("webViewLink", ""),
-                }
-                queue.append(c["id"])
-            else:
-                owners = c.get("owners") or []
-                raw_files.append({
-                    "id": c["id"],
-                    "title": c.get("name", ""),
-                    "mimeType": c.get("mimeType", ""),
-                    "fileSize": str(c.get("size", "0")),
-                    "parentId": parent,
-                    "owner": owners[0].get("emailAddress", "") if owners else "",
-                    "createdTime": c.get("createdTime", ""),
-                    "viewUrl": c.get("webViewLink", ""),
-                })
+    # استرجاع شجرة المجلدات والملفات المحفوظة مسبقاً إن وُجدت لتفادي إعادة حصر Drive
+    if resume_state and resume_state.get("folders") and resume_state.get("files"):
+        folders_list = resume_state["folders"]
+        raw_files = resume_state["files"]
+        scanned_ids = set(resume_state.get("scanned_ids") or [])
+    else:
+        folders = {
+            root["id"]: {"id": root["id"], "title": root["name"], "parentId": None, "viewUrl": ""}
+        }
+        raw_files = []
+        queue = [root["id"]]
 
-    if inspect_contents:
-        tmp_dir = tempfile.mkdtemp(prefix="sahma_ocr_")
-        for f in raw_files:
+        while queue:
             if time.monotonic() - start > budget_seconds:
                 return None
+            pid = queue.pop(0)
+            for c in list_children(service, pid):
+                parent = (c.get("parents") or [pid])[0]
+                if c.get("mimeType") == "application/vnd.google-apps.folder":
+                    folders[c["id"]] = {
+                        "id": c["id"],
+                        "title": c.get("name", ""),
+                        "parentId": parent,
+                        "viewUrl": c.get("webViewLink", ""),
+                    }
+                    queue.append(c["id"])
+                else:
+                    owners = c.get("owners") or []
+                    raw_files.append({
+                        "id": c["id"],
+                        "title": c.get("name", ""),
+                        "mimeType": c.get("mimeType", ""),
+                        "fileSize": str(c.get("size", "0")),
+                        "parentId": parent,
+                        "owner": owners[0].get("emailAddress", "") if owners else "",
+                        "createdTime": c.get("createdTime", ""),
+                        "viewUrl": c.get("webViewLink", ""),
+                        "extractedText": "",
+                        "contentSource": "pending",
+                        "readStatus": "pending",
+                    })
+
+        folders_list = list(folders.values())
+        scanned_ids = set()
+        # حفظ الحصر الأولي لشجرة المجلدات والملفات فوراً
+        if on_checkpoint:
+            on_checkpoint(folders_list, raw_files, scanned_ids)
+
+    if not inspect_contents:
+        for f in raw_files:
+            if f["id"] not in scanned_ids:
+                f["extractedText"] = ""
+                f["contentSource"] = "metadata_only"
+                f["readStatus"] = "metadata_only"
+                scanned_ids.add(f["id"])
+        return {
+            "partial": False,
+            "folders": folders_list,
+            "files": raw_files,
+            "scanned_ids": list(scanned_ids),
+        }
+
+    # تجميع الملفات حسب مجلد المؤشر (parentId) لإنهاء كل مؤشر وحفظه كاملاً قبل الانتقال للتالي
+    files_by_indicator_folder = {}
+    for f in raw_files:
+        files_by_indicator_folder.setdefault(f["parentId"], []).append(f)
+
+    tmp_dir = tempfile.mkdtemp(prefix="sahma_ocr_")
+    processed_since_save = 0
+
+    for folder_id, folder_files in files_by_indicator_folder.items():
+        # تخطّي مجلد المؤشر بالكامل إذا كانت جميع ملفاته مفحوصة مسبقاً
+        if all(f["id"] in scanned_ids for f in folder_files):
+            continue
+
+        for f in folder_files:
+            if f["id"] in scanned_ids:
+                continue
+
+            if time.monotonic() - start > budget_seconds:
+                if on_checkpoint:
+                    on_checkpoint(folders_list, raw_files, scanned_ids)
+                return {
+                    "partial": True,
+                    "folders": folders_list,
+                    "files": raw_files,
+                    "scanned_ids": list(scanned_ids),
+                }
+
             txt, src, read_st = extract_content(f, service, tmp_dir)
             f["extractedText"] = txt
             f["contentSource"] = src
             f["readStatus"] = read_st
-    else:
-        for f in raw_files:
-            f["extractedText"] = ""
-            f["contentSource"] = "metadata_only"
-            f["readStatus"] = "metadata_only"
+            scanned_ids.add(f["id"])
+            processed_since_save += 1
+
+            # حفظ دوري كل 3 ملفات لحماية المؤشرات المزدحمة بالصور (OCR)
+            if on_checkpoint and processed_since_save >= 3:
+                on_checkpoint(folders_list, raw_files, scanned_ids)
+                processed_since_save = 0
+
+        # حفظ فوري عند اكتمال جميع ملفات مجلد المؤشر
+        if on_checkpoint and processed_since_save > 0:
+            on_checkpoint(folders_list, raw_files, scanned_ids)
+            processed_since_save = 0
 
     return {
-        "folders": list(folders.values()),
+        "partial": False,
+        "folders": folders_list,
         "files": raw_files,
+        "scanned_ids": list(scanned_ids),
     }
